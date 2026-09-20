@@ -65,6 +65,56 @@ def _run_fzf(
     return [line for line in stdout.splitlines() if line.strip()]
 
 
+def _select_items_fzf(
+    candidates: list[tuple[str, Item, Path]],
+    prompt: str = "> ",
+    multi: bool = False,
+) -> list[tuple[str, Item, Path]]:
+    """Run fzf with indexed options to guarantee unambiguous selection of duplicate text items."""
+    if not candidates:
+        return []
+
+    lines = [f"{i:03d} │ {label}" for i, (label, _, _) in enumerate(candidates)]
+    selected_lines = _run_fzf(lines, prompt=prompt, multi=multi)
+    if not selected_lines:
+        return []
+
+    chosen: list[tuple[str, Item, Path]] = []
+    for sel in selected_lines:
+        try:
+            idx_str = sel.split("│")[0].strip()
+            idx = int(idx_str)
+            if 0 <= idx < len(candidates):
+                chosen.append(candidates[idx])
+        except (ValueError, IndexError):
+            continue
+    return chosen
+
+
+def _check_wip_capacity(
+    active_path: Path,
+    incoming_count: int,
+    wip_cap: int,
+    override: bool = False,
+    action_name: str = "add",
+) -> bool:
+    """Enforce WIP limit before promoting or adding to In Flight."""
+    if override:
+        return True
+    flight_items = store.read_items(active_path, Section.FLIGHT)
+    current_count = len(flight_items)
+    if current_count + incoming_count > wip_cap:
+        console.print(f"\n[bold red]🛑 WIP limit reached ({current_count}/{wip_cap} items In Flight)![/bold red]")
+        console.print(f"[red]Cannot {action_name} {incoming_count} item(s) without exceeding capacity.[/red]")
+        console.print("[yellow]To protect your focus, finish, block, or drop an active item first:[/yellow]")
+        console.print("  • [green]pkm done[/green]     - Mark a task complete")
+        console.print("  • [yellow]pkm block[/yellow]    - Move a blocked task to Waiting")
+        console.print("  • [dim]pkm drop[/dim]     - Drop a task")
+        console.print(f"Or bypass this limit using: [bold cyan]--override[/bold cyan] (or [bold cyan]-f[/bold cyan])\n")
+        return False
+    return True
+
+
 def _select_vault_interactive(cfg: PkmConfig) -> VaultConfig:
     """If user didn't specify vault or wants to choose via fzf."""
     vault_names = list(cfg.vaults.keys())
@@ -179,6 +229,7 @@ def act_cmd(
     scratch: bool = typer.Option(False, "-s", "--scratch", help="Add to Scratchpad"),
     blocked: bool = typer.Option(False, "-b", "--blocked", "-w", "--waiting", help="Add to Waiting/Blocked"),
     flight: bool = typer.Option(False, "-a", "--flight", help="Add to In Flight (default)"),
+    override: bool = typer.Option(False, "-f", "--override", help="Bypass WIP limit check"),
 ):
     """Add directly to active focus sections (In Flight, Waiting, or Scratchpad)."""
     cfg = config.load_config()
@@ -204,6 +255,10 @@ def act_cmd(
         target_section = Section.WAITING
         as_checkbox = False
 
+    if target_section == Section.FLIGHT:
+        if not _check_wip_capacity(active_path, 1, cfg.wip_cap, override, "add"):
+            raise typer.Exit(1)
+
     store.add_item(active_path, body, section=target_section, as_checkbox=as_checkbox)
     console.print(f"[green]Added to {target_section.header} ({target_vault.name}):[/green] {body}")
 
@@ -217,6 +272,7 @@ def act_cmd(
 @app.command("move")
 def move_cmd(
     vault: Optional[str] = typer.Option(None, "-v", "--vault", help="Target vault"),
+    override: bool = typer.Option(False, "-f", "--override", help="Bypass WIP limit check"),
 ):
     """Interactive 2-step triage tool: pick items across active/inbox, then pick destination."""
     cfg = config.load_config()
@@ -233,28 +289,27 @@ def move_cmd(
 
     if inbox_path.exists():
         for item in store.read_items(inbox_path):
-            candidates.append((f"[inbox]      {item.clean_text}", item, inbox_path))
+            candidates.append((f"[inbox]      L{item.line_number + 1:02d} │ {item.clean_text}", item, inbox_path))
 
     if active_path.exists():
         for item in store.read_items(active_path, Section.FLIGHT):
-            candidates.append((f"[in-flight]  {item.clean_text}", item, active_path))
+            candidates.append((f"[in-flight]  L{item.line_number + 1:02d} │ {item.clean_text}", item, active_path))
         for item in store.read_items(active_path, Section.WAITING):
-            candidates.append((f"[waiting]    {item.clean_text}", item, active_path))
+            candidates.append((f"[waiting]    L{item.line_number + 1:02d} │ {item.clean_text}", item, active_path))
         for item in store.read_items(active_path, Section.SCRATCH):
-            candidates.append((f"[scratch]    {item.clean_text}", item, active_path))
+            candidates.append((f"[scratch]    L{item.line_number + 1:02d} │ {item.clean_text}", item, active_path))
 
     if not candidates:
         console.print("[yellow]No items found to move.[/yellow]")
         return
 
-    item_strings = [c[0] for c in candidates]
-    selected_strings = _run_fzf(
-        item_strings,
+    chosen_items = _select_items_fzf(
+        candidates,
         prompt="Move Item(s) (Tab = select multiple, Enter = confirm) > ",
         multi=True,
     )
 
-    if not selected_strings:
+    if not chosen_items:
         return
 
     # Select destination
@@ -280,38 +335,40 @@ def move_cmd(
         if disp_choice:
             disposition = Disposition(disp_choice[0])
 
-    # Execute moves in reverse line order to preserve indices when modifying the same file
-    chosen_items = [c for c in candidates if c[0] in selected_strings]
-    # Sort descending by line_number to avoid shifting index bugs
-    chosen_items.sort(key=lambda c: c[1].line_number, reverse=True)
+    if "In Flight" in dest:
+        if not _check_wip_capacity(active_path, len(chosen_items), cfg.wip_cap, override, "move to In Flight"):
+            return
+
+    # Group chosen items by source file for atomic batch moves
+    by_src: dict[Path, list[Item]] = {}
+    for label, item, src_file in chosen_items:
+        by_src.setdefault(src_file, []).append(item)
 
     count = 0
-    for label, item, src_file in chosen_items:
+    for src_file, items_in_src in by_src.items():
         if "In Flight" in dest:
-            store.move_item(item, from_file=src_file, to_file=active_path, to_section=Section.FLIGHT)
+            count += store.move_items(items_in_src, from_file=src_file, to_file=active_path, to_section=Section.FLIGHT)
         elif "Waiting" in dest:
-            store.move_item(item, from_file=src_file, to_file=active_path, to_section=Section.WAITING)
+            count += store.move_items(items_in_src, from_file=src_file, to_file=active_path, to_section=Section.WAITING)
         elif "Scratchpad" in dest:
-            store.move_item(item, from_file=src_file, to_file=active_path, to_section=Section.SCRATCH)
+            count += store.move_items(items_in_src, from_file=src_file, to_file=active_path, to_section=Section.SCRATCH)
         elif "Done" in dest:
-            store.move_item(
-                item,
-                from_file=src_file,
-                to_file=log_path,
-                disposition=disposition,
-            )
+            count += store.move_items(items_in_src, from_file=src_file, to_file=log_path, disposition=disposition)
         elif "Someday" in dest:
-            store.move_item(item, from_file=src_file, to_file=someday_path)
+            count += store.move_items(items_in_src, from_file=src_file, to_file=someday_path)
 
+    for label, item, _ in chosen_items:
         console.print(f"[green]Moved:[/green] {item.clean_text} -> [cyan]{dest}[/cyan]")
-        count += 1
 
     console.print(f"[bold green]Successfully moved {count} item(s).[/bold green]")
     dashboard.render_count(vault_path, cfg.wip_cap)
 
 
 @app.command("promote")
-def promote_cmd(vault: Optional[str] = typer.Option(None, "-v", "--vault")):
+def promote_cmd(
+    vault: Optional[str] = typer.Option(None, "-v", "--vault"),
+    override: bool = typer.Option(False, "-f", "--override", help="Bypass WIP limit check"),
+):
     """fzf multi-select inbox items -> In Flight."""
     cfg = config.load_config()
     target_vault = _resolve_vault_param(cfg, vault)
@@ -324,21 +381,22 @@ def promote_cmd(vault: Optional[str] = typer.Option(None, "-v", "--vault")):
         console.print("[yellow]Inbox is empty.[/yellow]")
         return
 
-    item_map = {item.clean_text: item for item in items}
-    selected = _run_fzf(
-        list(item_map.keys()),
+    candidates = [(f"L{item.line_number + 1:02d} │ {item.clean_text}", item, inbox_path) for item in items]
+    chosen = _select_items_fzf(
+        candidates,
         prompt="Promote to In Flight (Tab = select multiple) > ",
         multi=True,
     )
-    if not selected:
+    if not chosen:
         return
 
-    # Sort descending by line number
-    items_to_move = [item_map[s] for s in selected]
-    items_to_move.sort(key=lambda x: x.line_number, reverse=True)
+    if not _check_wip_capacity(active_path, len(chosen), cfg.wip_cap, override, "promote"):
+        return
+
+    items_to_move = [c[1] for c in chosen]
+    store.move_items(items_to_move, from_file=inbox_path, to_file=active_path, to_section=Section.FLIGHT)
 
     for it in items_to_move:
-        store.move_item(it, from_file=inbox_path, to_file=active_path, to_section=Section.FLIGHT)
         console.print(f"[green]Promoted:[/green] {it.clean_text}")
 
     dashboard.render_count(vault_path, cfg.wip_cap)
@@ -358,25 +416,24 @@ def done_cmd(vault: Optional[str] = typer.Option(None, "-v", "--vault")):
         console.print("[yellow]No In Flight items to mark done.[/yellow]")
         return
 
-    item_map = {item.clean_text: item for item in items}
-    selected = _run_fzf(
-        list(item_map.keys()),
+    candidates = [(f"L{item.line_number + 1:02d} │ {item.clean_text}", item, active_path) for item in items]
+    chosen = _select_items_fzf(
+        candidates,
         prompt="Mark Done (Tab = select multiple) > ",
         multi=True,
     )
-    if not selected:
+    if not chosen:
         return
 
-    items_to_move = [item_map[s] for s in selected]
-    items_to_move.sort(key=lambda x: x.line_number, reverse=True)
+    items_to_move = [c[1] for c in chosen]
+    store.move_items(
+        items_to_move,
+        from_file=active_path,
+        to_file=log_path,
+        disposition=Disposition.COMPLETED,
+    )
 
     for it in items_to_move:
-        store.move_item(
-            it,
-            from_file=active_path,
-            to_file=log_path,
-            disposition=Disposition.COMPLETED,
-        )
         console.print(f"[green]Completed:[/green] {it.clean_text}")
 
     dashboard.render_count(vault_path, cfg.wip_cap)
@@ -396,25 +453,24 @@ def drop_cmd(vault: Optional[str] = typer.Option(None, "-v", "--vault")):
         console.print("[yellow]No items in active.md to drop.[/yellow]")
         return
 
-    item_map = {f"[{item.source_section}] {item.clean_text}": item for item in items}
-    selected = _run_fzf(
-        list(item_map.keys()),
+    candidates = [(f"[{item.source_section}] L{item.line_number + 1:02d} │ {item.clean_text}", item, active_path) for item in items]
+    chosen = _select_items_fzf(
+        candidates,
         prompt="Drop Item (Tab = select multiple) > ",
         multi=True,
     )
-    if not selected:
+    if not chosen:
         return
 
-    items_to_move = [item_map[s] for s in selected]
-    items_to_move.sort(key=lambda x: x.line_number, reverse=True)
+    items_to_move = [c[1] for c in chosen]
+    store.move_items(
+        items_to_move,
+        from_file=active_path,
+        to_file=log_path,
+        disposition=Disposition.DROPPED,
+    )
 
     for it in items_to_move:
-        store.move_item(
-            it,
-            from_file=active_path,
-            to_file=log_path,
-            disposition=Disposition.DROPPED,
-        )
         console.print(f"[yellow]Dropped:[/yellow] {it.clean_text}")
 
 
@@ -431,27 +487,29 @@ def block_cmd(vault: Optional[str] = typer.Option(None, "-v", "--vault")):
         console.print("[yellow]No In Flight items to block.[/yellow]")
         return
 
-    item_map = {item.clean_text: item for item in items}
-    selected = _run_fzf(
-        list(item_map.keys()),
+    candidates = [(f"L{item.line_number + 1:02d} │ {item.clean_text}", item, active_path) for item in items]
+    chosen = _select_items_fzf(
+        candidates,
         prompt="Move to Waiting / Blocked (Tab = select multiple) > ",
         multi=True,
     )
-    if not selected:
+    if not chosen:
         return
 
-    items_to_move = [item_map[s] for s in selected]
-    items_to_move.sort(key=lambda x: x.line_number, reverse=True)
+    items_to_move = [c[1] for c in chosen]
+    store.move_items(items_to_move, from_file=active_path, to_file=active_path, to_section=Section.WAITING)
 
     for it in items_to_move:
-        store.move_item(it, from_file=active_path, to_file=active_path, to_section=Section.WAITING)
         console.print(f"[yellow]Blocked:[/yellow] {it.clean_text}")
 
     dashboard.render_count(vault_path, cfg.wip_cap)
 
 
 @app.command("unblock")
-def unblock_cmd(vault: Optional[str] = typer.Option(None, "-v", "--vault")):
+def unblock_cmd(
+    vault: Optional[str] = typer.Option(None, "-v", "--vault"),
+    override: bool = typer.Option(False, "-f", "--override", help="Bypass WIP limit check"),
+):
     """fzf multi-select Waiting items -> In Flight."""
     cfg = config.load_config()
     target_vault = _resolve_vault_param(cfg, vault)
@@ -463,20 +521,22 @@ def unblock_cmd(vault: Optional[str] = typer.Option(None, "-v", "--vault")):
         console.print("[yellow]No waiting items to unblock.[/yellow]")
         return
 
-    item_map = {item.clean_text: item for item in items}
-    selected = _run_fzf(
-        list(item_map.keys()),
+    candidates = [(f"L{item.line_number + 1:02d} │ {item.clean_text}", item, active_path) for item in items]
+    chosen = _select_items_fzf(
+        candidates,
         prompt="Unblock to In Flight (Tab = select multiple) > ",
         multi=True,
     )
-    if not selected:
+    if not chosen:
         return
 
-    items_to_move = [item_map[s] for s in selected]
-    items_to_move.sort(key=lambda x: x.line_number, reverse=True)
+    if not _check_wip_capacity(active_path, len(chosen), cfg.wip_cap, override, "unblock"):
+        return
+
+    items_to_move = [c[1] for c in chosen]
+    store.move_items(items_to_move, from_file=active_path, to_file=active_path, to_section=Section.FLIGHT)
 
     for it in items_to_move:
-        store.move_item(it, from_file=active_path, to_file=active_path, to_section=Section.FLIGHT)
         console.print(f"[green]Unblocked:[/green] {it.clean_text}")
 
     dashboard.render_count(vault_path, cfg.wip_cap)
@@ -1264,6 +1324,7 @@ def sync_cmd(
     install: bool = typer.Option(False, "--install", help="Install automated background sync schedule"),
     uninstall: bool = typer.Option(False, "--uninstall", help="Remove background sync schedule"),
     status: bool = typer.Option(False, "--status", help="Check background sync schedule status"),
+    embed: bool = typer.Option(False, "-e", "--embed", help="Refresh AI embeddings after git sync"),
 ):
     """Sync all vaults with remote git repositories."""
     cfg = config.load_config()
@@ -1283,17 +1344,22 @@ def sync_cmd(
 
     sync.sync_all(cfg)
 
-    # Post-sync embedding refresh if AI API key is configured
-    try:
-        from pkm.ai import _get_api_key, AiEngine
-        from pkm.embeddings import EmbeddingIndex
-        _get_api_key(cfg)
-        idx = EmbeddingIndex(embed_fn=AiEngine(cfg).embed)
-        n = idx.refresh(list(cfg.vaults.values()))
-        if n > 0:
-            console.print(f"[dim]🔄 AI index refreshed: {n} chunks updated.[/dim]")
-    except Exception:
-        pass
+    # Post-sync embedding refresh only if explicitly requested or auto_embed is configured
+    if embed or cfg.ai.auto_embed:
+        try:
+            from pkm.ai import _get_api_key, AiEngine
+            from pkm.embeddings import EmbeddingIndex
+
+            _get_api_key(cfg)
+            console.print("[dim]🔄 Running post-sync vector embedding refresh...[/dim]")
+            idx = EmbeddingIndex(embed_fn=AiEngine(cfg).embed)
+            n = idx.refresh(list(cfg.vaults.values()))
+            if n > 0:
+                console.print(f"[dim]🔄 AI index refreshed: {n} chunks updated.[/dim]")
+            else:
+                console.print("[dim]🔄 AI index is already up to date.[/dim]")
+        except Exception as ex:
+            console.print(f"[dim yellow]Notice: Post-sync embedding refresh skipped: {ex}[/dim yellow]")
 
 
 @app.command("undo")

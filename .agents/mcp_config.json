@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "attic": {
+      "command": "uv",
+      "args": ["run", "--project", "${workspaceFolder}", "python", "-m", "pkm.mcp_server"]
+    }
+  }
+}

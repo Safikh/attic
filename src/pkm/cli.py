@@ -1497,19 +1497,43 @@ def agent_tools_cmd():
     else:
         console.print(f"[yellow]⚠️  Skill source not found at {skill_src_dir}[/yellow]")
 
-    # 3. Verify rules
+    # 3. Append global rule to ~/.gemini/GEMINI.md
+    global_gemini_file = Path.home() / ".gemini" / "GEMINI.md"
+    rule_marker = "Attic PKM Integration"
+    pkm_rule_text = (
+        "\n\n# Attic PKM Integration\n"
+        "- For personal task tracking and knowledge management, use Attic (pkm).\n"
+        "- Use the `pkm-query` skill and Attic MCP tools when interacting with notes or suggesting follow-up tasks.\n"
+        "- Always prefer `pkm suggest` to stage suggestions for user review rather than modifying files directly.\n"
+    )
+
+    if global_gemini_file.exists():
+        existing_rules = global_gemini_file.read_text(encoding="utf-8")
+        if rule_marker not in existing_rules:
+            with open(global_gemini_file, "a", encoding="utf-8") as f:
+                f.write(pkm_rule_text)
+            console.print(f"[green]✅ Global Rules appended to {global_gemini_file}[/green]")
+        else:
+            console.print(f"[dim]Global rules already present in {global_gemini_file}[/dim]")
+    else:
+        global_gemini_file.parent.mkdir(parents=True, exist_ok=True)
+        global_gemini_file.write_text(pkm_rule_text.lstrip(), encoding="utf-8")
+        console.print(f"[green]✅ Global Rules created at {global_gemini_file}[/green]")
+
+    # 4. Verify repo rules
     rules_file = project_root / "GEMINI.md"
     if rules_file.exists():
         console.print(f"[green]✅ Repo Rules: GEMINI.md[/green]")
     else:
         console.print(f"[yellow]⚠️  Repo Rules: GEMINI.md (not found)[/yellow]")
 
-    # 4. Verify workspace MCP config
+    # 5. Verify workspace MCP config
     workspace_mcp = project_root / ".agents" / "mcp_config.json"
     if workspace_mcp.exists():
         console.print(f"[green]✅ Workspace MCP: .agents/mcp_config.json[/green]")
     else:
         console.print(f"[yellow]⚠️  Workspace MCP: .agents/mcp_config.json (not found)[/yellow]")
 
-    console.print(f"\n[bold green]🎉 Attic AI tools & skill are now permanently active machine-wide.[/bold green]")
+    console.print(f"\n[bold green]🎉 Attic AI tools, skill, & global rules are now permanently active machine-wide.[/bold green]")
+
 

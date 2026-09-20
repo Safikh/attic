@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json as json_mod
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -732,8 +734,12 @@ def review_cmd(vault: Optional[str] = typer.Option(None, "-v", "--vault")):
 def ctx_cmd(
     tag: Optional[str] = typer.Argument(None, help="Filter tag, or --auto"),
     auto: bool = typer.Option(False, "--auto", help="Infer tag from current git repo"),
+    format: str = typer.Option("text", "--format", "-f", help="Output format: 'text' or 'json'"),
+    stats: bool = typer.Option(False, "--stats", help="Append WIP/inbox/completion metrics"),
+    include_projects: bool = typer.Option(False, "--include-projects", help="Append project notes for referenced tags"),
 ):
     """Export read-only active/inbox/log context for AI agents."""
+    import json as json_mod
     cfg = config.load_config()
     filter_tag = tag
 
@@ -744,34 +750,510 @@ def ctx_cmd(
         else:
             filter_tag = None
 
-    for v_name, vault in cfg.vaults.items():
-        v_path = Path(vault.path)
-        printed_vault = False
+    if format == "json":
+        output = {"vaults": {}, "filter_tag": filter_tag}
 
-        for f_name in ["active.md", "inbox.md", "log.md"]:
-            f_path = v_path / f_name
-            if not f_path.exists() or f_path.stat().st_size == 0:
-                continue
+        for v_name, vault in cfg.vaults.items():
+            v_path = Path(vault.path)
+            vault_data = {"path": str(v_path)}
+            referenced_tags = set()
 
-            content = f_path.read_text()
-            if filter_tag:
-                lines = [
-                    l
-                    for l in content.splitlines()
-                    if l.startswith("#") or f"[{filter_tag}]" in l or filter_tag.lower() in l.lower()
-                ]
-                if lines:
+            for f_name in ["active.md", "inbox.md", "log.md"]:
+                f_path = v_path / f_name
+                if not f_path.exists() or f_path.stat().st_size == 0:
+                    continue
+
+                items = store.read_items(f_path)
+                if filter_tag:
+                    items = [
+                        i for i in items
+                        if i.tag == filter_tag or (filter_tag and filter_tag.lower() in i.clean_text.lower())
+                    ]
+
+                if items:
+                    vault_data[f_name] = [
+                        {
+                            "text": i.clean_text,
+                            "tag": i.tag,
+                            "section": i.source_section.value if isinstance(i.source_section, Section) else str(i.source_section),
+                        }
+                        for i in items
+                    ]
+                    for i in items:
+                        if i.tag:
+                            referenced_tags.add(i.tag)
+
+            if include_projects and referenced_tags:
+                projects_data = {}
+                for ptag in sorted(referenced_tags):
+                    proj_file = v_path / "projects" / f"{ptag}.md"
+                    if proj_file.exists():
+                        projects_data[ptag] = proj_file.read_text().strip()
+                if projects_data:
+                    vault_data["projects"] = projects_data
+
+            if stats:
+                flight_count = store.count_flight_items(v_path / "active.md")
+                inbox_items = store.read_items(v_path / "inbox.md")
+                done_today, last_done = store.get_completions_today(v_path / "log.md")
+                done_week = store.get_completions_this_week(v_path / "log.md")
+                vault_data["stats"] = {
+                    "wip_count": flight_count,
+                    "wip_cap": cfg.wip_cap,
+                    "inbox_count": len(inbox_items),
+                    "done_today": done_today,
+                    "done_this_week": done_week,
+                    "last_completed": last_done,
+                }
+
+            if len(vault_data) > 1:  # More than just 'path'
+                output["vaults"][v_name] = vault_data
+
+        console.print(json_mod.dumps(output, indent=2, default=str))
+    else:
+        # Original text output
+        for v_name, vault in cfg.vaults.items():
+            v_path = Path(vault.path)
+            printed_vault = False
+
+            for f_name in ["active.md", "inbox.md", "log.md"]:
+                f_path = v_path / f_name
+                if not f_path.exists() or f_path.stat().st_size == 0:
+                    continue
+
+                content = f_path.read_text()
+                if filter_tag:
+                    lines = [
+                        l
+                        for l in content.splitlines()
+                        if l.startswith("#") or f"[{filter_tag}]" in l or filter_tag.lower() in l.lower()
+                    ]
+                    if lines:
+                        if not printed_vault:
+                            console.print(f"\n=== PKM VAULT: {v_name.upper()} ({v_path}) ===")
+                            printed_vault = True
+                        console.print(f"--- {f_name} (filtered: {filter_tag}) ---")
+                        console.print("\n".join(lines))
+                else:
                     if not printed_vault:
                         console.print(f"\n=== PKM VAULT: {v_name.upper()} ({v_path}) ===")
                         printed_vault = True
-                    console.print(f"--- {f_name} (filtered: {filter_tag}) ---")
-                    console.print("\n".join(lines))
-            else:
-                if not printed_vault:
-                    console.print(f"\n=== PKM VAULT: {v_name.upper()} ({v_path}) ===")
-                    printed_vault = True
-                console.print(f"--- {f_name} ---")
-                console.print(content.strip())
+                    console.print(f"--- {f_name} ---")
+                    console.print(content.strip())
+
+            if include_projects and printed_vault:
+                projects_dir = v_path / "projects"
+                if projects_dir.is_dir():
+                    for proj_file in sorted(projects_dir.glob("*.md")):
+                        if filter_tag and filter_tag.lower() != proj_file.stem.lower():
+                            continue
+                        console.print(f"--- projects/{proj_file.name} ---")
+                        console.print(proj_file.read_text().strip())
+
+            if stats and printed_vault:
+                flight_count = store.count_flight_items(v_path / "active.md")
+                inbox_items = store.read_items(v_path / "inbox.md")
+                done_today, _ = store.get_completions_today(v_path / "log.md")
+                done_week = store.get_completions_this_week(v_path / "log.md")
+                console.print(f"--- stats ---")
+                console.print(f"WIP: {flight_count}/{cfg.wip_cap} | Inbox: {len(inbox_items)} | Done today: {done_today} | This week: {done_week}")
+
+
+# -----------------------------------------------------------------------------
+# AI Suggestion Staging
+# -----------------------------------------------------------------------------
+@app.command("suggest")
+def suggest_cmd(
+    text: list[str] = typer.Argument(None, help="Suggestion text"),
+    action: str = typer.Option("capture", "--action", "-a", help="Proposed action: capture, promote, tag, archive"),
+    rationale: str = typer.Option("", "--rationale", "-r", help="Why this is suggested"),
+    vault: Optional[str] = typer.Option(None, "-v", "--vault"),
+):
+    """Stage a suggestion for user review (preferred AI write path)."""
+    cfg = config.load_config()
+    target_vault = _resolve_vault_param(cfg, vault)
+    vault_path = Path(target_vault.path)
+    suggestions_file = vault_path / "suggestions.md"
+
+    if not text:
+        console.print("[yellow]No suggestion text provided.[/yellow]")
+        raise typer.Exit(1)
+
+    suggestion_text = " ".join(text)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    lines = []
+    if suggestions_file.exists():
+        lines = suggestions_file.read_text().splitlines(True)
+    else:
+        lines = ["# Suggestions\n", "<!-- AI-generated suggestions. Review with `pkm review-suggestions` -->\n", "\n"]
+
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    entry_lines = [
+        f"\n## {now}\n",
+        f"- **{action}**: {suggestion_text}\n",
+    ]
+    if rationale:
+        entry_lines.append(f"  > Rationale: {rationale}\n")
+
+    lines.extend(entry_lines)
+    suggestions_file.write_text("".join(lines))
+    console.print(f"[green]Suggestion staged in {target_vault.name}/suggestions.md[/green]")
+    console.print(f"  [dim]{action}: {suggestion_text}[/dim]")
+    console.print(f"  [dim]Review with: pkm review-suggestions -v {target_vault.name}[/dim]")
+
+
+@app.command("review-suggestions")
+def review_suggestions_cmd(
+    vault: Optional[str] = typer.Option(None, "-v", "--vault"),
+):
+    """Interactively review and accept/reject AI suggestions."""
+    import re
+    cfg = config.load_config()
+    target_vault = _resolve_vault_param(cfg, vault)
+    vault_path = Path(target_vault.path)
+    suggestions_file = vault_path / "suggestions.md"
+
+    if not suggestions_file.exists():
+        console.print(f"[dim]No suggestions pending in {target_vault.name}.[/dim]")
+        return
+
+    content = suggestions_file.read_text()
+    # Parse suggestion entries: lines starting with "- **action**: text"
+    suggestion_lines = []
+    for i, line in enumerate(content.splitlines()):
+        m = re.match(r"^- \*\*(\w+)\*\*: (.+)$", line)
+        if m:
+            suggestion_lines.append({
+                "line_index": i,
+                "action": m.group(1),
+                "text": m.group(2),
+                "display": f"[{m.group(1)}] {m.group(2)}",
+            })
+
+    if not suggestion_lines:
+        console.print(f"[dim]No suggestions pending in {target_vault.name}.[/dim]")
+        return
+
+    # Use fzf for multi-select
+    fzf_input = "\n".join(f"{i}: {s['display']}" for i, s in enumerate(suggestion_lines))
+    selected = _run_fzf(
+        fzf_input,
+        prompt="Accept suggestions (TAB to select, ENTER to confirm): ",
+        multi=True,
+    )
+    if not selected:
+        console.print("[dim]No suggestions accepted.[/dim]")
+        return
+
+    accepted_indices = set()
+    for sel in selected:
+        idx_str = sel.split(":")[0].strip()
+        try:
+            accepted_indices.add(int(idx_str))
+        except ValueError:
+            continue
+
+    inbox_path = vault_path / "inbox.md"
+    active_path = vault_path / "active.md"
+
+    for idx in sorted(accepted_indices):
+        s = suggestion_lines[idx]
+        if s["action"] == "capture":
+            store.append_to_inbox(inbox_path, s["text"])
+            console.print(f"[green]✅ Captured:[/green] {s['text']}")
+        elif s["action"] == "promote":
+            store.add_item(active_path, s["text"], section=Section.FLIGHT, as_checkbox=True)
+            console.print(f"[green]✅ Promoted to In Flight:[/green] {s['text']}")
+        elif s["action"] == "tag":
+            store.append_to_inbox(inbox_path, s["text"])
+            console.print(f"[green]✅ Tagged & captured:[/green] {s['text']}")
+        elif s["action"] == "archive":
+            console.print(f"[yellow]📦 Archived (no action):[/yellow] {s['text']}")
+        else:
+            store.append_to_inbox(inbox_path, s["text"])
+            console.print(f"[green]✅ Captured (default):[/green] {s['text']}")
+
+    # Remove accepted suggestions from file
+    all_lines = content.splitlines(True)
+    accepted_line_indices = {suggestion_lines[i]["line_index"] for i in accepted_indices}
+    # Also remove the rationale lines (next line starting with "  >")
+    remove_indices = set()
+    for li in accepted_line_indices:
+        remove_indices.add(li)
+        # Check if next line is a rationale
+        if li + 1 < len(all_lines) and all_lines[li + 1].strip().startswith(">"):
+            remove_indices.add(li + 1)
+
+    new_lines = [l for i, l in enumerate(all_lines) if i not in remove_indices]
+    # Clean up empty section headers (## timestamp with nothing after)
+    cleaned = []
+    for i, line in enumerate(new_lines):
+        if line.startswith("## "):
+            # Check if next non-empty line is another header or EOF
+            remaining = [l for l in new_lines[i+1:] if l.strip()]
+            if not remaining or remaining[0].startswith("## ") or remaining[0].startswith("# "):
+                continue  # Skip orphaned section header
+        cleaned.append(line)
+
+    suggestions_file.write_text("".join(cleaned))
+
+    rejected = len(suggestion_lines) - len(accepted_indices)
+    if rejected > 0:
+        console.print(f"\n[dim]{rejected} suggestion(s) remain for later review.[/dim]")
+    else:
+        console.print(f"\n[green]All suggestions processed! 🎉[/green]")
+
+
+
+# -----------------------------------------------------------------------------
+# AI-First Commands: Ask, Index, Summarize, Relate, Triage
+# -----------------------------------------------------------------------------
+@app.command("ask")
+def ask_cmd(
+    question: list[str] = typer.Argument(..., help="Question or query for PKM assistant"),
+    vault: Optional[str] = typer.Option(None, "-v", "--vault", help="Target vault"),
+):
+    """Ask your PKM questions using an agentic query loop with live retrieval."""
+    from rich.markdown import Markdown
+    from pkm.ai import AiEngine
+
+    q_str = " ".join(question)
+    cfg = config.load_config()
+
+    def on_tool(name: str, args: dict):
+        args_str = ", ".join(f"{k}={v!r}" for k, v in args.items() if v is not None)
+        console.print(f"  [dim cyan]⚡ Tool: {name}({args_str})[/dim cyan]")
+
+    console.print(f"[bold cyan]🤖 Asking Attic AI:[/bold cyan] {q_str}\n")
+    try:
+        engine = AiEngine(cfg)
+        with console.status("[dim]Thinking and gathering notes...[/dim]"):
+            answer = engine.agent_query(q_str, on_tool_call=on_tool)
+        console.print()
+        console.print(Panel(Markdown(answer), title="[bold]Attic AI[/bold]", border_style="cyan", box=box.ROUNDED))
+    except Exception as ex:
+        console.print(f"[red]Error during AI query:[/red] {ex}")
+        raise typer.Exit(1)
+
+
+@app.command("index")
+def index_cmd(
+    vault: Optional[str] = typer.Option(None, "-v", "--vault", help="Vault to index"),
+    rebuild: bool = typer.Option(False, "--rebuild", help="Force complete rebuild of embedding index"),
+):
+    """Build or incrementally refresh the SQLite embedding index."""
+    from pkm.ai import AiEngine
+    from pkm.embeddings import EmbeddingIndex
+
+    cfg = config.load_config()
+    target_vaults = [_resolve_vault_param(cfg, vault)] if vault else list(cfg.vaults.values())
+
+    try:
+        engine = AiEngine(cfg)
+        idx = EmbeddingIndex(embed_fn=engine.embed)
+        console.print(f"[cyan]Scanning notes for embeddings {'(rebuild)' if rebuild else '(incremental)'}...[/cyan]")
+        count = idx.refresh(target_vaults, force=rebuild, progress_cb=lambda msg: console.print(f"  [dim]{msg}[/dim]"))
+        total = idx.count()
+        console.print(f"[green]✅ Index update complete: {count} chunks embedded (total in index: {total}).[/green]")
+    except Exception as ex:
+        console.print(f"[red]Error updating index:[/red] {ex}")
+        raise typer.Exit(1)
+
+
+@app.command("summarize")
+def summarize_cmd(
+    period: str = typer.Option("week", "--period", "-p", help="Timeframe: day, week, month"),
+    vault: Optional[str] = typer.Option(None, "-v", "--vault", help="Target vault"),
+):
+    """Generate a narrative summary of accomplishments and notes using AI."""
+    from datetime import timedelta
+    from rich.markdown import Markdown
+    from pkm.ai import AiEngine
+
+    cfg = config.load_config()
+    target_vaults = [_resolve_vault_param(cfg, vault)] if vault else list(cfg.vaults.values())
+
+    days = 1 if period == "day" else (30 if period == "month" else 7)
+    cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    all_completed = []
+    for vc in target_vaults:
+        log_file = Path(vc.path) / "log.md"
+        items = store.read_items(log_file)
+        for it in items:
+            m = re.search(r"\[(\d{4}-\d{2}-\d{2})", it.clean_text)
+            if m and m.group(1) >= cutoff_date:
+                all_completed.append(f"[{vc.name}] {it.clean_text}")
+
+    if not all_completed:
+        console.print(f"[yellow]No log entries found for the past {period} ({days} days).[/yellow]")
+        return
+
+    prompt = (
+        f"Here are the completed tasks and log entries from the user's PKM for the last {period} ({days} days):\n\n"
+        + "\n".join(f"- {c}" for c in all_completed)
+        + "\n\nPlease write a concise, motivating summary of what was accomplished, key themes, and momentum highlights. "
+        "Keep it structured and ADHD-friendly with bullet points."
+    )
+
+    try:
+        engine = AiEngine(cfg)
+        with console.status(f"[dim]Summarizing past {period}...[/dim]"):
+            summary = engine.complete(prompt)
+        console.print(Panel(Markdown(summary), title=f"[bold]Summary ({period.capitalize()})[/bold]", border_style="green", box=box.ROUNDED))
+    except Exception as ex:
+        console.print(f"[red]Error generating summary:[/red] {ex}")
+        raise typer.Exit(1)
+
+
+@app.command("relate")
+def relate_cmd(
+    text: list[str] = typer.Argument(..., help="Item text or concept to find relations for"),
+    vault: Optional[str] = typer.Option(None, "-v", "--vault", help="Target vault"),
+    k: int = typer.Option(5, "-k", help="Number of related items to surface"),
+):
+    """Surface semantically related items across all vault notes."""
+    from pkm.ai import AiEngine
+    from pkm.embeddings import EmbeddingIndex
+
+    cfg = config.load_config()
+    query_text = " ".join(text)
+
+    try:
+        engine = AiEngine(cfg)
+        idx = EmbeddingIndex(embed_fn=engine.embed)
+        target_vaults = [_resolve_vault_param(cfg, vault)] if vault else list(cfg.vaults.values())
+        idx.refresh(target_vaults)
+        hits = idx.search(query=query_text, k=k, vault=vault)
+
+        if not hits:
+            console.print("[dim]No related items found.[/dim]")
+            return
+
+        table = Table(title=f"Related Notes for: '{query_text}'", box=box.ROUNDED)
+        table.add_column("Similarity", style="bold green", justify="right", width=10)
+        table.add_column("Vault", style="cyan", width=12)
+        table.add_column("Source", style="dim", width=20)
+        table.add_column("Content")
+
+        for h in hits:
+            score_pct = f"{int(h.score * 100)}%"
+            table.add_row(score_pct, h.vault, f"{h.file}:{h.line}", h.text)
+
+        console.print(table)
+    except Exception as ex:
+        console.print(f"[red]Error finding related items:[/red] {ex}")
+        raise typer.Exit(1)
+
+
+@app.command("triage")
+def triage_cmd(
+    vault: Optional[str] = typer.Option(None, "-v", "--vault", help="Target vault"),
+    smart: bool = typer.Option(True, "--smart/--manual", help="Use AI to recommend actions for inbox items"),
+):
+    """Triage inbox items with AI-suggested dispositions or manual review."""
+    if not smart:
+        move_cmd(vault)
+        return
+
+    cfg = config.load_config()
+    target_vault = _resolve_vault_param(cfg, vault)
+    vault_path = Path(target_vault.path)
+    inbox_items = store.read_items(vault_path / "inbox.md")
+
+    if not inbox_items:
+        console.print(f"[dim]Inbox is empty in vault '{target_vault.name}'. Nothing to triage![/dim]")
+        return
+
+    active_items = store.read_items(vault_path / "active.md")
+    active_flight = [i.clean_text for i in active_items if i.source_section == Section.FLIGHT]
+
+    inbox_list = "\n".join(f"- ({idx}) {it.clean_text}" for idx, it in enumerate(inbox_items))
+    flight_list = "\n".join(f"- {t}" for t in active_flight)
+
+    prompt = f"""You are triaging the user's inbox items into appropriate actions.
+
+Current active In Flight tasks (WIP limit is {cfg.wip_cap}):
+{flight_list or "(None)"}
+
+Inbox items to triage:
+{inbox_list}
+
+For each numbered item, propose one action:
+- PROMOTE: Move to In Flight (only if high priority and fits within WIP cap)
+- WAITING: Move to Waiting / Blocked
+- ARCHIVE: Move to someday.md (stale or future idea)
+- DROP: Discard / log as dropped
+
+Format your response EXACTLY as a JSON array of objects with keys: "index" (int), "action" (string), "rationale" (string).
+Example:
+[
+  {{"index": 0, "action": "PROMOTE", "rationale": "High priority task matching active project"}},
+  {{"index": 1, "action": "ARCHIVE", "rationale": "Someday idea"}}
+]
+"""
+    import json as json_mod
+    from pkm.ai import AiEngine
+
+    try:
+        engine = AiEngine(cfg)
+        with console.status("[dim]AI is analyzing inbox items...[/dim]"):
+            raw_resp = engine.complete(prompt)
+
+        m = re.search(r"\[.*\]", raw_resp, re.DOTALL)
+        if not m:
+            console.print("[yellow]Could not parse structured triage recommendations. Raw response:[/yellow]")
+            console.print(raw_resp)
+            return
+
+        recs = json_mod.loads(m.group(0))
+        table = Table(title="AI Triage Recommendations", box=box.ROUNDED)
+        table.add_column("#", justify="right", style="dim", width=4)
+        table.add_column("Proposed Action", style="bold cyan", width=15)
+        table.add_column("Item", style="white")
+        table.add_column("Rationale", style="dim")
+
+        rec_map = {}
+        for r in recs:
+            idx = r.get("index")
+            if idx is not None and 0 <= idx < len(inbox_items):
+                item_text = inbox_items[idx].clean_text
+                action = r.get("action", "ARCHIVE").upper()
+                rat = r.get("rationale", "")
+                table.add_row(str(idx), action, item_text, rat)
+                rec_map[idx] = (action, inbox_items[idx])
+
+        console.print(table)
+        console.print("\nOptions: [bold]a[/bold]=apply all, [bold]s[/bold]=stage as suggestions, [bold]q[/bold]=quit")
+        choice = typer.prompt("Action", default="s").strip().lower()
+
+        if choice == "a":
+            sorted_indices = sorted(rec_map.keys(), reverse=True)
+            for idx in sorted_indices:
+                act, item = rec_map[idx]
+                if act == "PROMOTE":
+                    store.move_item(item, vault_path / "inbox.md", vault_path / "active.md", to_section=Section.FLIGHT)
+                elif act == "WAITING":
+                    store.move_item(item, vault_path / "inbox.md", vault_path / "active.md", to_section=Section.WAITING)
+                elif act == "DROP":
+                    store.move_item(item, vault_path / "inbox.md", vault_path / "log.md", disposition=Disposition.DROPPED)
+                elif act == "ARCHIVE":
+                    store.move_item(item, vault_path / "inbox.md", vault_path / "someday.md")
+            console.print("[green]✅ Applied all triage actions![/green]")
+        elif choice == "s":
+            for idx, (act, item) in rec_map.items():
+                rat = next((r.get("rationale", "") for r in recs if r.get("index") == idx), "")
+                act_name = "promote" if act == "PROMOTE" else ("archive" if act == "ARCHIVE" else "capture")
+                suggest_cmd(text=[item.clean_text], action=act_name, rationale=rat, vault=target_vault.name)
+            console.print(f"[green]✅ Staged {len(rec_map)} recommendation(s) in suggestions.md. Review anytime with 'pkm review-suggestions'![/green]")
+        else:
+            console.print("[dim]Aborted triage.[/dim]")
+    except Exception as ex:
+        console.print(f"[red]Error during smart triage:[/red] {ex}")
+        raise typer.Exit(1)
 
 
 # -----------------------------------------------------------------------------
@@ -800,6 +1282,18 @@ def sync_cmd(
         return
 
     sync.sync_all(cfg)
+
+    # Post-sync embedding refresh if AI API key is configured
+    try:
+        from pkm.ai import _get_api_key, AiEngine
+        from pkm.embeddings import EmbeddingIndex
+        _get_api_key(cfg)
+        idx = EmbeddingIndex(embed_fn=AiEngine(cfg).embed)
+        n = idx.refresh(list(cfg.vaults.values()))
+        if n > 0:
+            console.print(f"[dim]🔄 AI index refreshed: {n} chunks updated.[/dim]")
+    except Exception:
+        pass
 
 
 @app.command("undo")
@@ -948,3 +1442,60 @@ def add_vault_cmd(
     )
     config.save_config(cfg)
     console.print(f"[green]Added vault '{name}' ({alias or 'no alias'}) -> {vp}[/green]")
+
+
+@setup_app.command("agent-tools")
+def agent_tools_cmd():
+    """Register Attic MCP server and verify agent skill/rules files."""
+    import json as json_mod
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    gemini_config_dir = Path.home() / ".gemini" / "config"
+    mcp_config_file = gemini_config_dir / "mcp_config.json"
+
+    # 1. Register MCP server in global gemini config
+    mcp_entry = {
+        "attic": {
+            "command": "uv",
+            "args": ["run", "--project", str(project_root), "python", "-m", "pkm.mcp_server"],
+        }
+    }
+
+    existing = {}
+    if mcp_config_file.exists():
+        try:
+            existing = json_mod.loads(mcp_config_file.read_text())
+        except (json_mod.JSONDecodeError, OSError):
+            pass
+
+    servers = existing.get("mcpServers", {})
+    servers.update(mcp_entry)
+    existing["mcpServers"] = servers
+
+    gemini_config_dir.mkdir(parents=True, exist_ok=True)
+    mcp_config_file.write_text(json_mod.dumps(existing, indent=2) + "\n")
+    console.print(f"[green]✅ MCP server registered at {mcp_config_file}[/green]")
+    console.print(f"   [dim]Command: uv run --project {project_root} python -m pkm.mcp_server[/dim]")
+
+    # 2. Verify skill files
+    skill_file = project_root / ".agents" / "skills" / "pkm-query" / "SKILL.md"
+    if skill_file.exists():
+        console.print(f"[green]✅ Skill: .agents/skills/pkm-query/SKILL.md[/green]")
+    else:
+        console.print(f"[yellow]⚠️  Skill: .agents/skills/pkm-query/SKILL.md (not found)[/yellow]")
+
+    # 3. Verify rules
+    rules_file = project_root / "GEMINI.md"
+    if rules_file.exists():
+        console.print(f"[green]✅ Rules: GEMINI.md[/green]")
+    else:
+        console.print(f"[yellow]⚠️  Rules: GEMINI.md (not found)[/yellow]")
+
+    # 4. Verify workspace MCP config
+    workspace_mcp = project_root / ".agents" / "mcp_config.json"
+    if workspace_mcp.exists():
+        console.print(f"[green]✅ Workspace MCP: .agents/mcp_config.json[/green]")
+    else:
+        console.print(f"[yellow]⚠️  Workspace MCP: .agents/mcp_config.json (not found)[/yellow]")
+
+    console.print(f"\n[bold green]🎉 Agents can now query and interact with your PKM.[/bold green]")

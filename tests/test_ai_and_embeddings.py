@@ -172,3 +172,53 @@ def test_cli_relate(test_vault, monkeypatch):
     assert "92%" in res.output
     assert "OAuth token rotation" in res.output
 
+
+def test_embedding_index_prunes_deleted_files(test_vault):
+    v_path, db_path, cfg = test_vault
+
+    proj_dir = v_path / "projects"
+    proj_dir.mkdir(exist_ok=True)
+    f1 = proj_dir / "doc1.md"
+    f2 = proj_dir / "doc2.md"
+    f1.write_text("# Doc 1\n- Some info 1\n")
+    f2.write_text("# Doc 2\n- Some info 2\n")
+
+    def mock_embed(texts: list[str]) -> np.ndarray:
+        return np.ones((len(texts), 8), dtype=np.float32)
+
+    index = EmbeddingIndex(db_path=db_path, embed_fn=mock_embed)
+    count = index.refresh(list(cfg.vaults.values()))
+    assert count >= 2
+    initial_total = index.count()
+
+    # Now delete doc1.md from disk
+    f1.unlink()
+
+    # Refresh index
+    index.refresh(list(cfg.vaults.values()))
+
+    # Verify doc1 is no longer in items or file_meta
+    with sqlite3.connect(db_path) as conn:
+        meta_files = [r[0] for r in conn.execute("SELECT file FROM file_meta WHERE vault = 'v1'").fetchall()]
+        assert "projects/doc1.md" not in meta_files
+        assert "projects/doc2.md" in meta_files
+
+        item_files = [r[0] for r in conn.execute("SELECT file FROM items WHERE vault = 'v1'").fetchall()]
+        assert "projects/doc1.md" not in item_files
+        assert "projects/doc2.md" in item_files
+
+
+def test_save_config_omits_plaintext_api_key():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg_file = Path(tmpdir) / "config.toml"
+        cfg = PkmConfig(
+            default_vault="main",
+            ai=AiConfig(api_key="secret-key-12345", auto_embed=True),
+        )
+        with patch("pkm.config.CONFIG_FILE", cfg_file), patch("pkm.config.CONFIG_DIR", Path(tmpdir)):
+            config.save_config(cfg)
+            content = cfg_file.read_text()
+            assert "secret-key-12345" not in content
+            assert "auto_embed = true" in content
+
+

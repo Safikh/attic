@@ -68,6 +68,7 @@ def load_config() -> PkmConfig:
             model=ai_data.get("model", "gemini-2.5-flash"),
             embed_model=ai_data.get("embed_model", "text-embedding-004"),
             api_key=ai_data.get("api_key", ""),
+            auto_embed=ai_data.get("auto_embed", False),
         ),
     )
 
@@ -105,8 +106,9 @@ def save_config(config: PkmConfig) -> None:
     lines.append(f'provider = "{config.ai.provider}"')
     lines.append(f'model = "{config.ai.model}"')
     lines.append(f'embed_model = "{config.ai.embed_model}"')
-    if config.ai.api_key:
-        lines.append(f'api_key = "{config.ai.api_key}"')
+    lines.append(f"auto_embed = {'true' if config.ai.auto_embed else 'false'}")
+    # Note: api_key is intentionally NOT written to config.toml in plaintext.
+    # Users should set GEMINI_API_KEY or PKM_AI_KEY in their environment.
     lines.append("")
 
     CONFIG_FILE.write_text("\n".join(lines))

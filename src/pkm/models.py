@@ -85,6 +85,7 @@ class AiConfig:
     model: str = "gemini-2.5-flash"
     embed_model: str = "text-embedding-004"
     api_key: str = ""
+    auto_embed: bool = False
 
 
 @dataclass

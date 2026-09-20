@@ -155,18 +155,54 @@ class EmbeddingIndex:
                 with conn:
                     conn.execute("DELETE FROM items")
                     conn.execute("DELETE FROM file_meta")
+            elif vaults:
+                # Prune vaults that are no longer in the configured vault list
+                registered_vault_names = {vc.name for vc in vaults}
+                cursor = conn.execute("SELECT DISTINCT vault FROM file_meta")
+                for (v_name,) in cursor.fetchall():
+                    if v_name not in registered_vault_names:
+                        with conn:
+                            conn.execute("DELETE FROM items WHERE vault = ?", (v_name,))
+                            conn.execute("DELETE FROM file_meta WHERE vault = ?", (v_name,))
 
             for vc in vaults:
                 v_path = Path(vc.path)
                 if not v_path.is_dir():
                     continue
 
+                # Collect current valid markdown files on disk
+                disk_files: set[str] = set()
+                md_files_to_process = []
                 for md_file in sorted(v_path.rglob("*.md")):
                     # Skip backup, temp, or hidden files
                     if md_file.name.endswith((".bak", ".tmp")) or md_file.name.startswith("."):
                         continue
-
                     rel_path = str(md_file.relative_to(v_path))
+                    disk_files.add(rel_path)
+                    md_files_to_process.append((rel_path, md_file))
+
+                # Prune files previously indexed that are now deleted on disk
+                cursor = conn.execute(
+                    "SELECT file FROM file_meta WHERE vault = ?",
+                    (vc.name,),
+                )
+                indexed_files = {row[0] for row in cursor.fetchall()}
+                stale_files = indexed_files - disk_files
+                if stale_files:
+                    with conn:
+                        for sf in stale_files:
+                            conn.execute(
+                                "DELETE FROM items WHERE vault = ? AND file = ?",
+                                (vc.name, sf),
+                            )
+                            conn.execute(
+                                "DELETE FROM file_meta WHERE vault = ? AND file = ?",
+                                (vc.name, sf),
+                            )
+                    if progress_cb:
+                        progress_cb(f"Pruned {len(stale_files)} deleted file(s) from {vc.name} index.")
+
+                for rel_path, md_file in md_files_to_process:
                     cur_mtime = md_file.stat().st_mtime
 
                     # Check recorded mtime

@@ -14,9 +14,13 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from rich.console import Console
+
 from pkm import config, store
 from pkm.embeddings import EmbeddingIndex
 from pkm.models import PkmConfig, Section, VaultConfig
+
+console = Console(stderr=True)
 
 SYSTEM_INSTRUCTION = """You are Attic AI, the grounded, intelligent assistant embedded inside the user's personal action and knowledge workspace.
 
@@ -36,17 +40,24 @@ Guidelines:
 
 
 def _get_api_key(cfg: PkmConfig) -> str:
-    """Resolve API key from config or environment."""
-    key = cfg.ai.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("PKM_AI_KEY", "")
-    if not key:
-        raise ValueError(
-            "Gemini API key not found.\n"
-            "Please set GEMINI_API_KEY in your environment, or configure it via:\n"
-            "  [ai]\n"
-            '  api_key = "YOUR_API_KEY"\n'
-            f"in {config.CONFIG_FILE}"
+    """Resolve API key from environment (preferred) or config."""
+    env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("PKM_AI_KEY")
+    if env_key:
+        return env_key
+
+    if cfg.ai.api_key:
+        console.print(
+            "[dim yellow]Notice: Using API key from ~/.config/pkm/config.toml. "
+            "For better security, set GEMINI_API_KEY in your environment.[/dim yellow]"
         )
-    return key
+        return cfg.ai.api_key
+
+    raise ValueError(
+        "Gemini API key not found.\n"
+        "Please set GEMINI_API_KEY in your environment, or configure it via:\n"
+        "  export GEMINI_API_KEY='your-key-here'\n"
+        f"in your shell profile or config."
+    )
 
 
 class AiEngine:
@@ -74,6 +85,8 @@ class AiEngine:
         client = self.client
         embed_model = self.cfg.ai.embed_model
 
+        console.print(f"[dim]ℹ️ Sending {len(texts)} chunk(s) to Google Gemini API ({embed_model})...[/dim]")
+
         # Batch in chunks of 50
         batch_size = 50
         all_vecs = []
@@ -94,6 +107,7 @@ class AiEngine:
         from google.genai import types
 
         client = self.client
+        console.print(f"[dim]ℹ️ Sending completion prompt to Google Gemini ({self.cfg.ai.model})...[/dim]")
         cfg = types.GenerateContentConfig(
             system_instruction=system or SYSTEM_INSTRUCTION,
             temperature=0.3,

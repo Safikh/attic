@@ -3,9 +3,15 @@
 import os
 import re
 import shutil
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 from pkm.models import Disposition, Item, Section
 
@@ -17,6 +23,30 @@ ACTIVE_TEMPLATE = """# Active Focus
 
 ## Scratchpad
 """
+
+
+@contextmanager
+def vault_lock(path: Path):
+    """Acquire an advisory file lock for the vault to prevent concurrent write collisions."""
+    vault_dir = path if path.is_dir() else path.parent
+    lock_file = vault_dir / ".pkm.lock"
+    lock_fd = None
+    if fcntl:
+        try:
+            lock_fd = open(lock_file, "a+")
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            lock_fd = None
+    try:
+        yield
+    finally:
+        if fcntl and lock_fd:
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                lock_fd.close()
+            except Exception:
+                pass
+
 
 def _atomic_write(filepath: Path, lines: list[str]) -> None:
     """Safely write lines to filepath via a temporary file."""
@@ -99,78 +129,197 @@ def _insert_into_section(lines: list[str], section: Section, new_line: str) -> N
 
 def add_item(filepath: Path, text: str, section: Section = Section.FLIGHT, as_checkbox: bool = True) -> None:
     """Insert a new item into the file. For active.md, inserts into the specified section."""
-    if not filepath.exists() and filepath.name == "active.md":
-        _atomic_write(filepath, ACTIVE_TEMPLATE.splitlines(True))
-        
-    lines = []
-    if filepath.exists():
-        with open(filepath, "r") as f:
-            lines = f.readlines()
+    with vault_lock(filepath.parent):
+        if not filepath.exists() and filepath.name == "active.md":
+            _atomic_write(filepath, ACTIVE_TEMPLATE.splitlines(True))
             
-    if not lines and filepath.name == "active.md":
-        lines = ACTIVE_TEMPLATE.splitlines(True)
+        lines = []
+        if filepath.exists():
+            with open(filepath, "r") as f:
+                lines = f.readlines()
+                
+        if not lines and filepath.name == "active.md":
+            lines = ACTIVE_TEMPLATE.splitlines(True)
+            
+        prefix = "- [ ] " if as_checkbox else "- "
+        new_line = f"{prefix}{text}\n"
         
-    prefix = "- [ ] " if as_checkbox else "- "
-    new_line = f"{prefix}{text}\n"
-    
-    if filepath.name == "active.md":
-        _insert_into_section(lines, section, new_line)
-    else:
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        lines.append(new_line)
-        
-    _atomic_write(filepath, lines)
+        if filepath.name == "active.md":
+            _insert_into_section(lines, section, new_line)
+        else:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(new_line)
+            
+        _atomic_write(filepath, lines)
 
 def remove_item(filepath: Path, item: Item) -> bool:
     """Remove a specific item by matching both content and line number."""
     if not filepath.exists():
         return False
         
-    with open(filepath, "r") as f:
-        lines = f.readlines()
-        
-    if 0 <= item.line_number < len(lines):
-        if lines[item.line_number].rstrip('\n') == item.raw_line.rstrip('\n'):
-            lines.pop(item.line_number)
-            _atomic_write(filepath, lines)
-            return True
-            
-    return False
-
-def move_item(item: Item, from_file: Path, to_file: Path, to_section: Optional[Section] = None, disposition: Optional[Disposition] = None) -> None:
-    """Remove from source and add to destination atomically."""
-    if from_file == to_file:
-        with open(from_file, "r") as f:
+    with vault_lock(filepath.parent):
+        with open(filepath, "r") as f:
             lines = f.readlines()
             
-        if not (0 <= item.line_number < len(lines) and lines[item.line_number].rstrip('\n') == item.raw_line.rstrip('\n')):
-            return
-            
-        lines.pop(item.line_number)
-        
-        text = item.clean_text
-        prefix = "- [ ] " if to_section == Section.FLIGHT else "- "
-        new_line = f"{prefix}{text}\n"
-        
-        if to_section:
-            _insert_into_section(lines, to_section, new_line)
-        else:
-            if lines and not lines[-1].endswith("\n"):
-                lines[-1] += "\n"
-            lines.append(new_line)
-            
-        _atomic_write(from_file, lines)
-    else:
-        text = item.clean_text
-        if to_file.name == "log.md" and disposition:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M")
-            formatted_text = f"{disposition.value} [{now}]: {text}"
-            add_item(to_file, formatted_text, as_checkbox=False)
-        else:
-            add_item(to_file, text, section=to_section or Section.FLIGHT, as_checkbox=(to_section == Section.FLIGHT))
-            
-        remove_item(from_file, item)
+        if 0 <= item.line_number < len(lines):
+            if lines[item.line_number].rstrip('\n') == item.raw_line.rstrip('\n'):
+                lines.pop(item.line_number)
+                _atomic_write(filepath, lines)
+                return True
+                
+        return False
+
+def move_items(
+    items: list[Item],
+    from_file: Path,
+    to_file: Path,
+    to_section: Optional[Section] = None,
+    disposition: Optional[Disposition] = None,
+) -> int:
+    """Move one or more items atomically between sections or files.
+
+    Guarantees two-phase transactional safety with .bak snapshots and automatic rollback.
+    Returns the number of successfully moved items.
+    """
+    if not items:
+        return 0
+
+    with vault_lock(from_file.parent):
+        if from_file == to_file:
+            if not from_file.exists():
+                return 0
+            with open(from_file, "r") as f:
+                lines = f.readlines()
+
+            moved_count = 0
+            sorted_items = sorted(items, key=lambda x: x.line_number, reverse=True)
+            for item in sorted_items:
+                target_idx = None
+                if 0 <= item.line_number < len(lines) and lines[item.line_number].rstrip('\n') == item.raw_line.rstrip('\n'):
+                    target_idx = item.line_number
+                else:
+                    for i, line in enumerate(lines):
+                        if line.rstrip('\n') == item.raw_line.rstrip('\n'):
+                            target_idx = i
+                            break
+
+                if target_idx is not None:
+                    lines.pop(target_idx)
+                    text = item.clean_text
+                    prefix = "- [ ] " if to_section == Section.FLIGHT else "- "
+                    new_line = f"{prefix}{text}\n"
+
+                    if to_section:
+                        _insert_into_section(lines, to_section, new_line)
+                    else:
+                        if lines and not lines[-1].endswith("\n"):
+                            lines[-1] += "\n"
+                        lines.append(new_line)
+                    moved_count += 1
+
+            if moved_count > 0:
+                _atomic_write(from_file, lines)
+            return moved_count
+
+        # Cross-file move: Two-phase transactional update
+        if not from_file.exists():
+            return 0
+
+        with open(from_file, "r") as f:
+            from_lines = f.readlines()
+
+        to_lines = []
+        if to_file.exists():
+            with open(to_file, "r") as f:
+                to_lines = f.readlines()
+        elif to_file.name == "active.md":
+            to_lines = ACTIVE_TEMPLATE.splitlines(True)
+
+        sorted_items = sorted(items, key=lambda x: x.line_number, reverse=True)
+        moved_count = 0
+
+        for item in sorted_items:
+            target_idx = None
+            if 0 <= item.line_number < len(from_lines) and from_lines[item.line_number].rstrip('\n') == item.raw_line.rstrip('\n'):
+                target_idx = item.line_number
+            else:
+                for i, line in enumerate(from_lines):
+                    if line.rstrip('\n') == item.raw_line.rstrip('\n'):
+                        target_idx = i
+                        break
+
+            if target_idx is not None:
+                from_lines.pop(target_idx)
+                text = item.clean_text
+
+                if to_file.name == "log.md" and disposition:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    formatted_text = f"{disposition.value} [{now}]: {text}"
+                    new_line = f"- {formatted_text}\n"
+                    if to_lines and not to_lines[-1].endswith("\n"):
+                        to_lines[-1] += "\n"
+                    to_lines.append(new_line)
+                else:
+                    sec = to_section or Section.FLIGHT
+                    prefix = "- [ ] " if (sec == Section.FLIGHT and to_file.name == "active.md") else "- "
+                    new_line = f"{prefix}{text}\n"
+                    if to_file.name == "active.md":
+                        _insert_into_section(to_lines, sec, new_line)
+                    else:
+                        if to_lines and not to_lines[-1].endswith("\n"):
+                            to_lines[-1] += "\n"
+                        to_lines.append(new_line)
+                moved_count += 1
+
+        if moved_count == 0:
+            return 0
+
+        # Snapshot backups before touching either file
+        from_bak = from_file.with_suffix(from_file.suffix + ".bak")
+        to_bak = to_file.with_suffix(to_file.suffix + ".bak")
+        shutil.copy2(from_file, from_bak)
+        if to_file.exists():
+            shutil.copy2(to_file, to_bak)
+
+        from_tmp = from_file.with_suffix(".tmp")
+        to_tmp = to_file.with_suffix(".tmp")
+
+        try:
+            with open(from_tmp, "w") as f:
+                f.writelines(from_lines)
+            with open(to_tmp, "w") as f:
+                f.writelines(to_lines)
+
+            # Atomic commit of both files
+            os.replace(to_tmp, to_file)
+            os.replace(from_tmp, from_file)
+        except Exception:
+            # Automatic rollback from snapshots on error
+            if from_bak.exists():
+                shutil.copy2(from_bak, from_file)
+            if to_bak.exists():
+                shutil.copy2(to_bak, to_file)
+            elif to_file.exists() and not to_lines:
+                to_file.unlink(missing_ok=True)
+            if from_tmp.exists():
+                from_tmp.unlink(missing_ok=True)
+            if to_tmp.exists():
+                to_tmp.unlink(missing_ok=True)
+            raise
+
+        return moved_count
+
+
+def move_item(
+    item: Item,
+    from_file: Path,
+    to_file: Path,
+    to_section: Optional[Section] = None,
+    disposition: Optional[Disposition] = None,
+) -> None:
+    """Move a single item atomically between files or sections."""
+    move_items([item], from_file=from_file, to_file=to_file, to_section=to_section, disposition=disposition)
 
 def append_to_inbox(filepath: Path, text: str) -> None:
     """Append a timestamped line to inbox.md."""

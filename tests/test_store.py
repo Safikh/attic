@@ -110,3 +110,69 @@ def test_tags_and_provenance():
         tags = store.get_all_tags(vault)
         assert tags["quotient"] == 1
         assert tags["research"] == 1
+
+
+def test_batch_move_items_transactional():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        inbox_path = Path(tmpdir) / "inbox.md"
+        active_path = Path(tmpdir) / "active.md"
+
+        store.append_to_inbox(inbox_path, "Item 1")
+        store.append_to_inbox(inbox_path, "Item 2")
+        store.append_to_inbox(inbox_path, "Item 3")
+
+        items = store.read_items(inbox_path)
+        assert len(items) == 3
+
+        # Move Item 1 and Item 3 to flight
+        moved = store.move_items([items[0], items[2]], from_file=inbox_path, to_file=active_path, to_section=Section.FLIGHT)
+        assert moved == 2
+
+        # Verify inbox has only Item 2 left
+        remaining_inbox = store.read_items(inbox_path)
+        assert len(remaining_inbox) == 1
+        assert "Item 2" in remaining_inbox[0].clean_text
+
+        # Verify active has Item 1 and Item 3 in flight
+        flight = store.read_items(active_path, Section.FLIGHT)
+        assert len(flight) == 2
+        assert any("Item 1" in it.clean_text for it in flight)
+        assert any("Item 3" in it.clean_text for it in flight)
+
+
+def test_transactional_move_rollback_on_failure(monkeypatch):
+    import os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        inbox_path = Path(tmpdir) / "inbox.md"
+        active_path = Path(tmpdir) / "active.md"
+
+        store.append_to_inbox(inbox_path, "Safe Item 1")
+        store.append_to_inbox(inbox_path, "Safe Item 2")
+
+        items = store.read_items(inbox_path)
+        assert len(items) == 2
+
+        # Simulate failure during os.replace on the second file
+        original_replace = os.replace
+        replace_count = 0
+
+        def faulty_replace(src, dst):
+            nonlocal replace_count
+            replace_count += 1
+            if replace_count == 2:
+                raise OSError("Simulated disk error during second replace")
+            original_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", faulty_replace)
+
+        try:
+            store.move_items([items[0]], from_file=inbox_path, to_file=active_path, to_section=Section.FLIGHT)
+        except OSError:
+            pass
+
+        # Verify both files are rolled back cleanly
+        inbox_after = store.read_items(inbox_path)
+        assert len(inbox_after) == 2
+        assert "Safe Item 1" in inbox_after[0].clean_text
+        assert "Safe Item 2" in inbox_after[1].clean_text
+

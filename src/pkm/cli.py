@@ -1477,19 +1477,32 @@ def agent_tools_cmd():
     console.print(f"[green]✅ MCP server registered at {mcp_config_file}[/green]")
     console.print(f"   [dim]Command: uv run --project {project_root} python -m pkm.mcp_server[/dim]")
 
-    # 2. Verify skill files
-    skill_file = project_root / ".agents" / "skills" / "pkm-query" / "SKILL.md"
-    if skill_file.exists():
-        console.print(f"[green]✅ Skill: .agents/skills/pkm-query/SKILL.md[/green]")
+    # 2. Install skill globally into ~/.gemini/config/skills/pkm-query
+    global_skills_dir = gemini_config_dir / "skills" / "pkm-query"
+    skill_src_dir = project_root / ".agents" / "skills" / "pkm-query"
+
+    if skill_src_dir.exists():
+        global_skills_dir.mkdir(parents=True, exist_ok=True)
+        (global_skills_dir / "references").mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(skill_src_dir / "SKILL.md", global_skills_dir / "SKILL.md")
+
+        ref_src = skill_src_dir / "references"
+        if ref_src.exists():
+            for ref_file in ref_src.glob("*.md"):
+                shutil.copy2(ref_file, global_skills_dir / "references" / ref_file.name)
+
+        console.print(f"[green]✅ Global Skill installed at {global_skills_dir}[/green]")
+        console.print("   [dim]Active across all repositories and workspaces on this machine.[/dim]")
     else:
-        console.print(f"[yellow]⚠️  Skill: .agents/skills/pkm-query/SKILL.md (not found)[/yellow]")
+        console.print(f"[yellow]⚠️  Skill source not found at {skill_src_dir}[/yellow]")
 
     # 3. Verify rules
     rules_file = project_root / "GEMINI.md"
     if rules_file.exists():
-        console.print(f"[green]✅ Rules: GEMINI.md[/green]")
+        console.print(f"[green]✅ Repo Rules: GEMINI.md[/green]")
     else:
-        console.print(f"[yellow]⚠️  Rules: GEMINI.md (not found)[/yellow]")
+        console.print(f"[yellow]⚠️  Repo Rules: GEMINI.md (not found)[/yellow]")
 
     # 4. Verify workspace MCP config
     workspace_mcp = project_root / ".agents" / "mcp_config.json"
@@ -1498,4 +1511,5 @@ def agent_tools_cmd():
     else:
         console.print(f"[yellow]⚠️  Workspace MCP: .agents/mcp_config.json (not found)[/yellow]")
 
-    console.print(f"\n[bold green]🎉 Agents can now query and interact with your PKM.[/bold green]")
+    console.print(f"\n[bold green]🎉 Attic AI tools & skill are now permanently active machine-wide.[/bold green]")
+

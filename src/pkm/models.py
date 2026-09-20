@@ -78,6 +78,16 @@ class VaultConfig:
 
 
 @dataclass
+class AiConfig:
+    """Configuration for AI features."""
+
+    provider: str = "gemini"
+    model: str = "gemini-2.5-flash"
+    embed_model: str = "text-embedding-004"
+    api_key: str = ""
+
+
+@dataclass
 class PkmConfig:
     """Global PKM configuration."""
 
@@ -87,6 +97,8 @@ class PkmConfig:
     greeting_cooldown_hours: int = 2
     sync_enabled: bool = True
     sync_interval_minutes: int = 30
+    mcp_allow_direct_writes: bool = False
+    ai: AiConfig = field(default_factory=AiConfig)
 
     def resolve_vault(self, name_or_alias: str | None = None) -> VaultConfig:
         """Resolve a vault name or alias to a VaultConfig.

@@ -8,7 +8,7 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-from pkm.models import PkmConfig, VaultConfig
+from pkm.models import AiConfig, PkmConfig, VaultConfig
 
 CONFIG_DIR = Path.home() / ".config" / "pkm"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
@@ -52,6 +52,8 @@ def load_config() -> PkmConfig:
         )
 
     sync_data = raw.get("sync", {})
+    mcp_data = raw.get("mcp", {})
+    ai_data = raw.get("ai", {})
 
     return PkmConfig(
         vaults=vaults,
@@ -60,6 +62,13 @@ def load_config() -> PkmConfig:
         greeting_cooldown_hours=settings.get("greeting_cooldown_hours", 2),
         sync_enabled=sync_data.get("enabled", True),
         sync_interval_minutes=sync_data.get("interval_minutes", 30),
+        mcp_allow_direct_writes=mcp_data.get("allow_direct_writes", False),
+        ai=AiConfig(
+            provider=ai_data.get("provider", "gemini"),
+            model=ai_data.get("model", "gemini-2.5-flash"),
+            embed_model=ai_data.get("embed_model", "text-embedding-004"),
+            api_key=ai_data.get("api_key", ""),
+        ),
     )
 
 
@@ -86,6 +95,18 @@ def save_config(config: PkmConfig) -> None:
     lines.append("[sync]")
     lines.append(f"enabled = {'true' if config.sync_enabled else 'false'}")
     lines.append(f"interval_minutes = {config.sync_interval_minutes}")
+    lines.append("")
+
+    lines.append("[mcp]")
+    lines.append(f"allow_direct_writes = {'true' if config.mcp_allow_direct_writes else 'false'}")
+    lines.append("")
+
+    lines.append("[ai]")
+    lines.append(f'provider = "{config.ai.provider}"')
+    lines.append(f'model = "{config.ai.model}"')
+    lines.append(f'embed_model = "{config.ai.embed_model}"')
+    if config.ai.api_key:
+        lines.append(f'api_key = "{config.ai.api_key}"')
     lines.append("")
 
     CONFIG_FILE.write_text("\n".join(lines))

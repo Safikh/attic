@@ -37,14 +37,18 @@ def sync_vault(vault_path: Path) -> tuple[bool, str]:
         # Fall back to merge
         res = run_cmd(["git", "merge", f"origin/{branch}"], cwd=vault_path)
         if res.returncode != 0:
-            # Merge conflicts
-            run_cmd(["git", "add", "-A"], cwd=vault_path)
-            run_cmd(["git", "commit", "-m", "sync: merge conflicts"], cwd=vault_path)
-            conflict = True
-        else:
-            conflict = False
-    else:
-        conflict = False
+            # Merge conflicts detected! Do NOT auto-commit or push corrupted conflict markers.
+            diff_res = run_cmd(["git", "diff", "--name-only", "--diff-filter=U"], cwd=vault_path)
+            conflicts = [f.strip() for f in diff_res.stdout.splitlines() if f.strip()]
+            if not conflicts:
+                status_res = run_cmd(["git", "status", "--porcelain"], cwd=vault_path)
+                conflicts = [
+                    line[3:].strip()
+                    for line in status_res.stdout.splitlines()
+                    if line.startswith(("UU", "AA", "UD", "DU"))
+                ]
+            conflict_str = ", ".join(conflicts) if conflicts else "unknown files"
+            return False, f"Merge conflict detected in: {conflict_str}"
         
     # Commit local changes if any
     res = run_cmd(["git", "status", "--porcelain"], cwd=vault_path)
@@ -58,8 +62,6 @@ def sync_vault(vault_path: Path) -> tuple[bool, str]:
     if res.returncode != 0:
         return False, f"Failed to push: {res.stderr.strip()}"
         
-    if conflict:
-        return True, "Synced with merge conflicts"
     return True, "Successfully synced"
 
 
@@ -70,12 +72,18 @@ def sync_all(config: PkmConfig) -> None:
             console.print(f"Syncing vault '{name}'...")
             success, msg = sync_vault(vault_path)
             if success:
-                if "conflict" in msg.lower():
-                    console.print(f"⚠️  {name}: {msg}")
-                else:
-                    console.print(f"✅ {name}: {msg}")
+                console.print(f"✅ {name}: {msg}")
             else:
-                console.print(f"❌ {name}: {msg}")
+                if "conflict" in msg.lower():
+                    console.print(f"\n[bold red]⚠️  Merge conflict detected in vault '{name}'![/bold red]")
+                    console.print(f"[red]   {msg}[/red]")
+                    console.print("[yellow]   Auto-sync stopped to protect your notes from being corrupted or pushed.[/yellow]")
+                    console.print("[cyan]   To resolve:[/cyan]")
+                    console.print("     1. Open the conflicting file(s) and resolve the git conflict markers.")
+                    console.print("     2. Run [bold]git add <file>[/bold] and [bold]git commit[/bold] in your vault directory.")
+                    console.print("     3. Run [bold]pkm sync[/bold] to resume synchronization.\n")
+                else:
+                    console.print(f"❌ {name}: {msg}")
 
 
 def get_plist_path() -> Path:
